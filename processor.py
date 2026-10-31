@@ -89,6 +89,13 @@ RE_AADHAAR_VID = re.compile(
     re.IGNORECASE,
 )
 
+# Aadhaar Fast-Track Cascading Filter Definitions
+# Gate 1 Master Keys: "GOVERNMENT" (for front) or "UIDAI" (for back) - case-insensitive
+GATE1_AADHAAR_MASTER_KEYS: Tuple[str, ...] = ("GOVERNMENT", "UIDAI")
+
+# Gate 2 Secondary Verification regex: \d{4}\s\d{4}\s\d{4}
+RE_AADHAAR_444 = re.compile(r"\b\d{4}\s\d{4}\s\d{4}\b")
+
 # Driving License Number (e.g. MH14 20110062821, MH-14-2011-0062821, DL-0420110149646)
 RE_DRIVING_LICENSE = re.compile(
     r"\b([A-Z]{2}[\-\s]?\d{2}[\-\s]?(?:19|20)\d{2}[\-\s]?\d{6,8}|[A-Z]{2}\d{2}\s?\d{11})\b"
@@ -625,6 +632,89 @@ def _normalize_aadhaar_display(raw_num: str) -> str:
     return raw_num.strip()
 
 
+def validate_aadhaar_cascading(
+    ocr_text: str,
+) -> Tuple[bool, bool, bool, Optional[str]]:
+    """
+    Cascading Filter (Short-Circuit) Two-Step Validation for Aadhaar Fast-Track Mode:
+
+    1. Gate 1 (Primary Master Keys):
+       After the fast OCR pass, check ONLY for the most unique strings:
+       "GOVERNMENT" (for front) or "UIDAI" (for back) - case-insensitive.
+       If NEITHER of these Gate 1 keywords is found, immediately short-circuit.
+       Do not waste time checking other keywords.
+
+    2. Gate 2 (Secondary Verification):
+       IF Gate 1 passes (meaning it might be a government ID), THEN and ONLY THEN
+       run the secondary checks (looking for "DOB", "Male/Female", or the `\\d{4}\\s\\d{4}\\s\\d{4}` regex)
+       to confirm it is an actual Aadhaar card before triggering the heavy InsightFace engine.
+
+    Returns:
+       `(is_confirmed, gate1_passed, gate2_passed, extracted_id)`
+    """
+    if not ocr_text or not ocr_text.strip():
+        return False, False, False, None
+
+    upper_text = ocr_text.upper()
+
+    # Gate 1: Check ONLY for the primary master keys: "GOVERNMENT" or "UIDAI" (case-insensitive)
+    has_gate1 = ("GOVERNMENT" in upper_text) or ("UIDAI" in upper_text)
+    if not has_gate1:
+        # Immediate short-circuit: do not evaluate secondary keywords or regexes
+        return False, False, False, None
+
+    lower_text = ocr_text.lower()
+
+    # Gate 2: Secondary Verification (DOB, Male/Female, or \\d{4}\\s\\d{4}\\s\\d{4} regex)
+    has_dob = (
+        "dob" in lower_text
+        or "date of birth" in lower_text
+        or "year of birth" in lower_text
+        or "yob" in lower_text
+        or bool(RE_DOB_LABELED.search(ocr_text))
+    )
+    has_gender = (
+        "male" in lower_text
+        or "female" in lower_text
+        or "/ male" in lower_text
+        or "/ female" in lower_text
+        or "transgender" in lower_text
+    )
+
+    m_444 = RE_AADHAAR_444.search(ocr_text)
+    m_spaced = RE_AADHAAR_SPACED.search(ocr_text)
+    m_masked = RE_AADHAAR_MASKED.search(ocr_text)
+    m_full = RE_AADHAAR_FULL.search(ocr_text)
+    m_vid = RE_AADHAAR_VID.search(ocr_text)
+
+    has_number = False
+    extracted_id: Optional[str] = None
+
+    if m_444 and _is_valid_aadhaar_number(m_444.group(0)):
+        has_number = True
+        extracted_id = _normalize_aadhaar_display(m_444.group(0))
+    elif m_spaced and _is_valid_aadhaar_number(m_spaced.group(1)):
+        has_number = True
+        extracted_id = _normalize_aadhaar_display(m_spaced.group(1))
+    elif m_masked:
+        has_number = True
+        extracted_id = _normalize_aadhaar_display(m_masked.group(1))
+    elif m_full and _is_valid_aadhaar_number(m_full.group(1)):
+        has_number = True
+        extracted_id = _normalize_aadhaar_display(m_full.group(1))
+    elif m_vid:
+        has_number = True
+        extracted_id = f"VID: {m_vid.group(1).strip()}"
+
+    gate2_passed = bool(has_dob or has_gender or has_number)
+    is_confirmed = bool(has_gate1 and gate2_passed)
+
+    if is_confirmed and not extracted_id and m_444:
+        extracted_id = _normalize_aadhaar_display(m_444.group(0))
+
+    return is_confirmed, True, gate2_passed, extracted_id
+
+
 def normalize_date_string(date_raw: str) -> Optional[str]:
     """
     Normalize raw date strings into standard ISO YYYY-MM-DD.
@@ -801,6 +891,13 @@ def classify_document_text(ocr_text: str) -> Tuple[bool, str, Optional[str]]:
         scores["Aadhaar Card"] += 11
     if "government of india" in lower_text or "govt of india" in lower_text:
         scores["Aadhaar Card"] += 8
+
+    # Cascading Gate 1 + Gate 2 validation
+    is_aadhaar_conf, g1_pass, g2_pass, cascaded_id = validate_aadhaar_cascading(cleaned)
+    if is_aadhaar_conf:
+        scores["Aadhaar Card"] += 15
+        if not extracted_ids["Aadhaar Card"] and cascaded_id:
+            extracted_ids["Aadhaar Card"] = cascaded_id
 
     # --- 3. Driving License ---
     for kw, weight in (
@@ -1873,50 +1970,141 @@ def process_file(
         }
 
     # -------------------------------------------------------------------------
-    # ID VAULT MODE: OCR + Auto-Rotation + Indian ID Classification
+    # ID VAULT MODE: Cascading Filter (Aadhaar Fast-Track) or Standard Inspection
     # -------------------------------------------------------------------------
-    try:
-        (
-            oriented_img,
-            ocr_text,
-            avg_conf,
-            is_document,
-            doc_category,
-            extracted_id_number,
-            applied_rotation,
-        ) = inspect_with_auto_rotation(pil_img, ocr_engine=ocr_engine)
-    except Exception as exc:
-        logger.warning("OCR analysis failed on '%s': %s", norm_path, exc)
-        file_id = active_db.upsert_file(
-            file_path=norm_path,
-            file_hash_or_mtime=mtime_str,
-            file_size=file_size,
-            is_document=False,
-            doc_category=database.UNREADABLE_OR_CORRUPT,
-            ocr_text=f"Inspection error: {exc}",
-            thumbnail_b64=b64_thumb,
-            date_taken=photo_date_taken,
-        )
-        return {
-            "file_id": file_id,
-            "file_path": norm_path,
-            "is_document": False,
-            "doc_category": database.UNREADABLE_OR_CORRUPT,
-            "status": "inspection_failed",
-        }
+    clean_target = (
+        target_category.strip()
+        if (target_category and target_category.strip() and target_category.strip().lower() != "all")
+        else None
+    )
+    is_aadhaar_fast_track = bool(
+        (clean_target and "aadhaar" in clean_target.lower())
+        or str(scan_mode).strip().lower() in ("aadhaar_fast_track", "aadhaar_fast", "fast_track_aadhaar", "aadhaar")
+    )
 
-    # Check targeted document category filter if specified (skips unnecessary face detection if not matching)
-    clean_target = target_category.strip() if (target_category and target_category.strip() and target_category.strip().lower() != 'all') else None
-    if clean_target is not None:
-        if not is_document or doc_category != clean_target:
-            # File does not match target category (e.g. searching ONLY PAN Cards) -> discard/skip
+    if is_aadhaar_fast_track:
+        # Pre-flight Fast OCR Pass (0° orientation, no angle classification overhead)
+        text_fast, conf_fast, is_vert_fast = _extract_ocr_detailed(
+            pil_img, ocr_engine=ocr_engine, allow_angle_cls=False
+        )
+
+        is_confirmed, gate1_passed, gate2_passed, extracted_id = validate_aadhaar_cascading(text_fast)
+
+        if not gate1_passed:
+            # Immediate Short-Circuit: Neither "GOVERNMENT" nor "UIDAI" found
+            # Discard immediately, call del on image tensors, run gc.collect()
+            try:
+                pil_img.close()
+            except Exception:
+                pass
+            del pil_img
+            import gc
+            gc.collect()
             return {
                 "file_id": None,
                 "file_path": norm_path,
                 "is_document": False,
                 "doc_category": database.NOT_A_DOCUMENT,
-                "status": "skipped_not_target_category",
+                "status": "skipped_aadhaar_gate1_short_circuit",
+                "gate1_passed": False,
+                "gate2_passed": False,
             }
+
+        # Gate 1 passed! Now check Gate 2 (Secondary Verification)
+        oriented_img = pil_img
+        applied_rotation = 0
+        if not gate2_passed and is_vert_fast:
+            # If text is vertical/sideways, test 90° rotation to check if Gate 2 passes
+            img_90 = rotate_pil_clockwise(pil_img, 90)
+            text_90, conf_90, _ = _extract_ocr_detailed(
+                img_90, ocr_engine=ocr_engine, allow_angle_cls=False
+            )
+            is_conf_90, g1_90, g2_90, id_90 = validate_aadhaar_cascading(text_90)
+            if g2_90:
+                is_confirmed, gate2_passed, extracted_id = True, True, id_90
+                text_fast, conf_fast = text_90, conf_90
+                oriented_img = img_90
+                applied_rotation = 90
+            else:
+                try:
+                    img_90.close()
+                except Exception:
+                    pass
+
+        if not gate2_passed:
+            # Gate 2 failed: Not an actual Aadhaar card
+            try:
+                pil_img.close()
+            except Exception:
+                pass
+            if oriented_img is not pil_img:
+                try:
+                    oriented_img.close()
+                except Exception:
+                    pass
+            del pil_img
+            import gc
+            gc.collect()
+            return {
+                "file_id": None,
+                "file_path": norm_path,
+                "is_document": False,
+                "doc_category": database.NOT_A_DOCUMENT,
+                "status": "skipped_aadhaar_gate2_failed",
+                "gate1_passed": True,
+                "gate2_passed": False,
+            }
+
+        # Confirmed Aadhaar Card!
+        ocr_text = text_fast
+        avg_conf = conf_fast
+        is_document = True
+        doc_category = "Aadhaar Card"
+        extracted_id_number = extracted_id
+
+    else:
+        # Standard multi-category inspection with auto-rotation & classification
+        try:
+            (
+                oriented_img,
+                ocr_text,
+                avg_conf,
+                is_document,
+                doc_category,
+                extracted_id_number,
+                applied_rotation,
+            ) = inspect_with_auto_rotation(pil_img, ocr_engine=ocr_engine)
+        except Exception as exc:
+            logger.warning("OCR analysis failed on '%s': %s", norm_path, exc)
+            file_id = active_db.upsert_file(
+                file_path=norm_path,
+                file_hash_or_mtime=mtime_str,
+                file_size=file_size,
+                is_document=False,
+                doc_category=database.UNREADABLE_OR_CORRUPT,
+                ocr_text=f"Inspection error: {exc}",
+                thumbnail_b64=b64_thumb,
+                date_taken=photo_date_taken,
+            )
+            return {
+                "file_id": file_id,
+                "file_path": norm_path,
+                "is_document": False,
+                "doc_category": database.UNREADABLE_OR_CORRUPT,
+                "status": "inspection_failed",
+            }
+
+        # Check targeted document category filter if specified (skips unnecessary face detection if not matching)
+        if clean_target is not None:
+            if not is_document or doc_category != clean_target:
+                # File does not match target category (e.g. searching ONLY PAN Cards) -> discard/skip
+                return {
+                    "file_id": None,
+                    "file_path": norm_path,
+                    "is_document": False,
+                    "doc_category": database.NOT_A_DOCUMENT,
+                    "status": "skipped_not_target_category",
+                }
 
     # If OCR indicates this is not a verified document, detect if this is a general Face Gallery Photo
     gallery_faces: List[Dict[str, Any]] = []
@@ -2211,9 +2399,12 @@ def process_candidates(
     progress_callback: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
     stop_event: Optional[threading.Event] = None,
     db_manager: Optional[database.DatabaseManager] = None,
+    scan_mode: str = "id_vault",
+    target_category: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Process a sequence of candidate files with optional progress reporting and graceful cancellation.
+    Process a sequence of candidate files with optional progress reporting,
+    targeted filtering (including Aadhaar Fast-Track), and graceful cancellation.
     """
     active_db = db_manager or database.db
     total = len(candidate_files)
@@ -2228,12 +2419,30 @@ def process_candidates(
             break
 
         try:
-            result = process_file(candidate, db_manager=active_db)
+            result = process_file(
+                candidate,
+                db_manager=active_db,
+                scan_mode=scan_mode,
+                target_category=target_category,
+            )
             processed_count += 1
             if result.get("is_document"):
                 documents_found += 1
             else:
                 non_documents_count += 1
+
+            # Cascading Filter & Short-Circuit skip handler
+            if result.get("status") in (
+                "skipped_aadhaar_gate1_short_circuit",
+                "skipped_aadhaar_gate2_failed",
+                "skipped_not_target_category",
+            ):
+                if progress_callback is not None:
+                    try:
+                        progress_callback(idx, total, result)
+                    except Exception as cb_exc:
+                        logger.debug("Progress callback error: %s", cb_exc)
+                continue
         except Exception as exc:
             errors_count += 1
             logger.error("Unhandled error processing '%s': %s", candidate, exc)
