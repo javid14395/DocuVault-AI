@@ -154,11 +154,10 @@ class PyWebViewApi:
 
 
 def ensure_app_directories() -> None:
-    """Create `data/faces` and `data/thumbnails` directories on startup."""
-    faces_dir = BASE_DIR / "data" / "faces"
-    thumbnails_dir = BASE_DIR / "data" / "thumbnails"
-    faces_dir.mkdir(parents=True, exist_ok=True)
-    thumbnails_dir.mkdir(parents=True, exist_ok=True)
+    """Create `data/faces`, `data/thumbnails`, and `exports` directories on startup."""
+    (BASE_DIR / "data" / "faces").mkdir(parents=True, exist_ok=True)
+    (BASE_DIR / "data" / "thumbnails").mkdir(parents=True, exist_ok=True)
+    (BASE_DIR / "exports").mkdir(parents=True, exist_ok=True)
 
 
 def wait_for_server_ready(host: str, port: int, timeout_sec: float = 12.0) -> bool:

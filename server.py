@@ -13,6 +13,7 @@ import io
 import logging
 import mimetypes
 import os
+import queue
 import shutil
 import subprocess
 import threading
@@ -30,19 +31,26 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-import database
-import processor
-import scanner
+try:
+    from backend import database, processor, scanner, studio, watcher
+except ImportError:
+    import database, processor, scanner, studio, watcher
 import setup_assets
-import studio
-import watcher
 
 logger = logging.getLogger("docuvault.server")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = (BASE_DIR / "data").resolve()
+EXPORTS_DIR = (BASE_DIR / "exports").resolve()
 UI_DIR = (BASE_DIR / "ui").resolve()
 ASSETS_DIR = (UI_DIR / "assets").resolve()
+CSS_DIR = (UI_DIR / "css").resolve()
+JS_DIR = (UI_DIR / "js").resolve()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+CSS_DIR.mkdir(parents=True, exist_ok=True)
+JS_DIR.mkdir(parents=True, exist_ok=True)
 UI_INDEX_PATH = UI_DIR / "index.html"
 
 ALLOWED_STREAM_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
@@ -527,76 +535,199 @@ class BackgroundScanManager:
                 target_category or "All",
             )
 
-            # Process candidates concurrently with hardware-adaptive ThreadPoolExecutor
-            def _inspect_task(path_str: str) -> Tuple[str, bool, Optional[str]]:
-                if self._stop_event.is_set():
-                    return path_str, False, None
-                try:
-                    res = processor.process_file(
-                        path_str,
-                        db_manager=self._db,
-                        scan_mode=scan_mode,
-                        target_category=target_category,
-                    )
-                    return path_str, bool(res.get("is_document", False)), None
-                except Exception as ex:
-                    return path_str, False, str(ex)
-
+            # Producer-Consumer Architecture:
+            # - Fast I/O workers load images, check dimensions and OpenCV edge-density heuristics,
+            #   recording skipped/unreadable files instantly via AsyncDatabaseWriter.
+            # - Exactly ONE dedicated AI worker thread pulls from ai_queue to run RapidOCR & InsightFace,
+            #   completely eliminating lock contention and RAM accumulation.
             last_ws_emit = 0.0
-            max_in_flight = max(4, max_workers * 3)
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="DocuVaultWorker") as pool:
-                cand_iter = iter(candidates)
-                in_flight: Set[Any] = set()
 
-                for _ in range(min(max_in_flight, total)):
-                    cp = next(cand_iter, None)
-                    if cp is None:
+            def _record_progress(c_path: str, found_doc: bool, err_msg: Optional[str] = None) -> None:
+                nonlocal last_ws_emit
+                now_mono = time.monotonic()
+                snap_to_emit: Optional[Dict[str, Any]] = None
+
+                with self._lock:
+                    self._current_file_path = c_path
+                    self._processed_count += 1
+                    if found_doc:
+                        self._documents_found_count += 1
+                    if err_msg:
+                        self._last_error = f"{os.path.basename(c_path)}: {err_msg}"
+                    elapsed_inspect = max(0.001, now_mono - inspect_start)
+                    self._scan_speed_files_per_sec = self._processed_count / elapsed_inspect
+                    if (
+                        found_doc
+                        or self._processed_count == 1
+                        or self._processed_count >= total
+                        or (now_mono - last_ws_emit) >= 0.08
+                    ):
+                        last_ws_emit = now_mono
+                        snap_to_emit = self._unlocked_status_snapshot()
+
+                if snap_to_emit is not None:
+                    snap_payload = _build_scan_ws_payload(snap_to_emit)
+                    snap_payload["new_document_found"] = bool(found_doc)
+                    ws_hub.broadcast_from_thread(snap_payload)
+
+                if self._processed_count % 128 == 0:
+                    import gc
+                    gc.collect()
+
+            ai_queue: queue.Queue = queue.Queue(maxsize=16)
+
+            def _ai_consumer_loop() -> None:
+                while True:
+                    item = ai_queue.get()
+                    if item is None:
+                        ai_queue.task_done()
                         break
-                    in_flight.add(pool.submit(_inspect_task, cp))
-
-                while in_flight:
+                    c_path, preloaded_img = item
                     if self._stop_event.is_set():
-                        pool.shutdown(wait=False, cancel_futures=True)
+                        if preloaded_img is not None:
+                            try:
+                                preloaded_img.close()
+                            except Exception:
+                                pass
+                        ai_queue.task_done()
+                        continue
+                    try:
+                        res = processor.process_file(
+                            c_path,
+                            db_manager=self._db,
+                            scan_mode=scan_mode,
+                            target_category=target_category,
+                            preloaded_image=preloaded_img,
+                        )
+                        _record_progress(c_path, bool(res.get("is_document", False)), None)
+                    except Exception as ex:
+                        _record_progress(c_path, False, str(ex))
+                    finally:
+                        if preloaded_img is not None:
+                            try:
+                                preloaded_img.close()
+                            except Exception:
+                                pass
+                        ai_queue.task_done()
+
+            ai_thread = threading.Thread(
+                target=_ai_consumer_loop,
+                name="DocuVaultDedicatedAIWorker",
+                daemon=True,
+            )
+            ai_thread.start()
+
+            def _io_producer_task(path_str: str) -> None:
+                if self._stop_event.is_set():
+                    return
+                norm_p = database.normalize_file_path(path_str)
+                try:
+                    st = os.stat(norm_p)
+                    f_size = int(st.st_size)
+                    mtime_f = float(st.st_mtime)
+                    mtime_s = database.normalize_hash_or_mtime(mtime_f)
+                except OSError as exc:
+                    self._db.enqueue_upsert_file(
+                        file_path=norm_p,
+                        file_hash_or_mtime="0.0",
+                        file_size=0,
+                        is_document=False,
+                        doc_category=database.UNREADABLE_OR_CORRUPT,
+                        ocr_text=f"File access error: {exc}",
+                    )
+                    _record_progress(norm_p, False, str(exc))
+                    return
+
+                # Check if already scanned in SQLite
+                if self._db.is_file_scanned(norm_p, mtime_s):
+                    existing = self._db.get_file_by_path(norm_p)
+                    is_doc = bool(existing.get("is_document", False)) if existing else False
+                    _record_progress(norm_p, is_doc, None)
+                    return
+
+                # Attempt fast visual load in I/O worker
+                try:
+                    pil_img = processor.load_visual_image(norm_p)
+                except processor.PasswordProtectedError as pass_err:
+                    self._db.enqueue_upsert_file(
+                        file_path=norm_p,
+                        file_hash_or_mtime=mtime_s,
+                        file_size=f_size,
+                        is_document=True,
+                        doc_category=database.PASSWORD_PROTECTED,
+                        ocr_text="Password protected encrypted PDF. Click 'Unlock PDF' to decrypt.",
+                    )
+                    _record_progress(norm_p, True, None)
+                    return
+                except (processor.VisualLoadError, Exception) as load_err:
+                    self._db.enqueue_upsert_file(
+                        file_path=norm_p,
+                        file_hash_or_mtime=mtime_s,
+                        file_size=f_size,
+                        is_document=False,
+                        doc_category=database.UNREADABLE_OR_CORRUPT,
+                        ocr_text=f"Load error: {load_err}",
+                    )
+                    _record_progress(norm_p, False, str(load_err))
+                    return
+
+                # Dimension check
+                w, h = pil_img.size
+                if w < processor.MIN_IMAGE_WIDTH or h < processor.MIN_IMAGE_HEIGHT:
+                    self._db.enqueue_upsert_file(
+                        file_path=norm_p,
+                        file_hash_or_mtime=mtime_s,
+                        file_size=f_size,
+                        is_document=False,
+                        doc_category=database.NOT_A_DOCUMENT,
+                    )
+                    try:
+                        pil_img.close()
+                    except Exception:
+                        pass
+                    _record_progress(norm_p, False, None)
+                    return
+
+                # OpenCV Edge-density pre-filter (< 2ms) for document scanning
+                if scan_mode != "face_search":
+                    has_edges, _, _ = processor.check_text_edge_density(pil_img)
+                    if not has_edges:
+                        self._db.enqueue_upsert_file(
+                            file_path=norm_p,
+                            file_hash_or_mtime=mtime_s,
+                            file_size=f_size,
+                            is_document=False,
+                            doc_category=database.NOT_A_DOCUMENT,
+                            ocr_text="Image lacks high-frequency edge structure (blank/plain image).",
+                        )
+                        try:
+                            pil_img.close()
+                        except Exception:
+                            pass
+                        _record_progress(norm_p, False, None)
+                        return
+
+                # Route to dedicated AI worker thread via bounded queue
+                while not self._stop_event.is_set():
+                    try:
+                        ai_queue.put((norm_p, pil_img), timeout=0.1)
                         break
+                    except queue.Full:
+                        continue
 
-                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        c_path, found_doc, err_msg = future.result()
-                        now_mono = time.monotonic()
-                        snap_to_emit: Optional[Dict[str, Any]] = None
+            io_workers = max(1, min(max_workers, 4))
+            with ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="DocuVaultIOWorker") as pool:
+                list(pool.map(_io_producer_task, candidates))
 
-                        with self._lock:
-                            self._current_file_path = c_path
-                            self._processed_count += 1
-                            if found_doc:
-                                self._documents_found_count += 1
-                            if err_msg:
-                                self._last_error = f"{os.path.basename(c_path)}: {err_msg}"
-                            elapsed_inspect = max(0.001, now_mono - inspect_start)
-                            self._scan_speed_files_per_sec = self._processed_count / elapsed_inspect
-                            if (
-                                found_doc
-                                or self._processed_count == 1
-                                or self._processed_count >= total
-                                or (now_mono - last_ws_emit) >= 0.08
-                            ):
-                                last_ws_emit = now_mono
-                                snap_to_emit = self._unlocked_status_snapshot()
+            # Signal AI worker completion and join
+            ai_queue.put(None)
+            ai_thread.join(timeout=30.0)
 
-                        if snap_to_emit is not None:
-                            snap_payload = _build_scan_ws_payload(snap_to_emit)
-                            snap_payload["new_document_found"] = bool(found_doc)
-                            ws_hub.broadcast_from_thread(snap_payload)
-
-                        if self._processed_count % 128 == 0:
-                            import gc
-                            gc.collect()
-
-                    while len(in_flight) < max_in_flight and not self._stop_event.is_set():
-                        nxt = next(cand_iter, None)
-                        if nxt is None:
-                            break
-                        in_flight.add(pool.submit(_inspect_task, nxt))
+            # Flush all asynchronous database writes to SQLite
+            try:
+                self._db.flush_writes()
+            except Exception as fl_err:
+                logger.warning("DB flush writes warning: %s", fl_err)
 
             # Prune thread-local SQLite connections and trigger WAL checkpoint
             try:
@@ -888,9 +1019,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount `ui/assets` directly at `/assets` and `/ui/assets` via FastAPI StaticFiles
+# Mount `ui/assets`, `/css`, and `/js` directly via FastAPI StaticFiles
 app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 app.mount("/ui/assets", StaticFiles(directory=str(ASSETS_DIR)), name="ui_assets")
+app.mount("/css", StaticFiles(directory=str(CSS_DIR)), name="css")
+app.mount("/js", StaticFiles(directory=str(JS_DIR)), name="js")
 
 
 # -----------------------------------------------------------------------------

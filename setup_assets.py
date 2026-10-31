@@ -221,6 +221,22 @@ def ensure_local_assets(force_download: bool = False) -> bool:
             except OSError:
                 pass
 
+    # Synchronize modular UI folders (`ui/css` and `ui/js`)
+    css_dir = UI_DIR / "css"
+    js_dir = UI_DIR / "js"
+    css_dir.mkdir(parents=True, exist_ok=True)
+    js_dir.mkdir(parents=True, exist_ok=True)
+    for css_file in ASSETS_DIR.glob("*.css"):
+        try:
+            shutil.copy2(css_file, css_dir / css_file.name)
+        except OSError:
+            pass
+    for js_file in ASSETS_DIR.glob("*.js"):
+        try:
+            shutil.copy2(js_file, js_dir / js_file.name)
+        except OSError:
+            pass
+
     if all_ready:
         _ASSETS_VERIFIED_IN_PROCESS = True
     return all_ready
