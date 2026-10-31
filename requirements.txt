@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+websockets
+pywebview
+rapidocr-onnxruntime
+onnxruntime-gpu==1.24.1
+insightface
+opencv-python
+numpy
+Pillow
+pypdfium2
+pydantic
+watchdog
+cryptography
