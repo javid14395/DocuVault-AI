@@ -1706,7 +1706,15 @@
         }).join('');
 
         const totalDocsEl = document.getElementById('statTotalDocs');
-        if (totalDocsEl) totalDocsEl.textContent = stats.total_documents || 0;
+        if (totalDocsEl) {
+          if (state.scanMode === 'id_vault') {
+            const faceCount = Number(catCounts['Face Gallery Photo']) || 0;
+            const unreadCount = Number(catCounts['Unidentified / Unreadable']) || 0;
+            totalDocsEl.textContent = Math.max(0, (Number(stats.total_documents) || 0) - faceCount - unreadCount);
+          } else {
+            totalDocsEl.textContent = stats.total_documents || 0;
+          }
+        }
         const totalPeopleEl = document.getElementById('statTotalPeople');
         if (totalPeopleEl) totalPeopleEl.textContent = stats.total_people || 0;
         const totalScannedEl = document.getElementById('statTotalScanned');
@@ -2071,7 +2079,7 @@
                   `
                   : `
                     <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-950/40 border border-slate-800/50 text-[11px] text-slate-500">
-                      <span class="italic truncate">Verified via OCR / Face AI</span>
+                      <span class="italic truncate">${doc.doc_category === 'Face Gallery Photo' ? 'Gallery Photo / Face Cluster' : 'Verified via OCR / Face AI'}</span>
                       ${
                         doc.formatted_date_taken
                           ? `<span class="not-italic font-mono text-[10px] text-cyan-300/90 shrink-0" title="EXIF Date Taken: ${escapeHtml(doc.formatted_datetime_taken || doc.date_taken || '')}">${escapeHtml(doc.formatted_date_taken)}</span>`

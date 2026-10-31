@@ -1942,7 +1942,7 @@ def api_open_folder(payload: OpenFolderRequest) -> Dict[str, Any]:
             detail="Windows Explorer integration is only supported on Windows.",
         )
 
-    subprocess.Popen(f'explorer /select,"{os.path.normpath(norm_path)}"')
+    subprocess.Popen(["explorer", f"/select,{os.path.normpath(norm_path)}"])
     return {
         "ok": True,
         "file_path": norm_path,
@@ -2091,8 +2091,6 @@ def _run_folder_face_job(job: _FolderFaceJob, embedding: List[float], threshold:
             )
 
     try:
-        with job.lock:
-            job.total = len(processor.list_images_in_folder(job.folder, recursive=recursive))
         result = processor.search_folder_for_face(
             job.folder,
             embedding,
@@ -2337,16 +2335,28 @@ def api_stream_image(
     ext = resolved.suffix.lower()
 
     if ext == ".pdf" and not raw:
-        pil_img = processor.load_visual_image(resolved)
+        try:
+            pil_img = processor.load_visual_image(resolved)
+        except processor.PasswordProtectedError:
+            raise HTTPException(status_code=403, detail="PDF is password-protected.")
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Unable to render PDF preview: {exc}")
+
         if pil_img is None:
             raise HTTPException(status_code=422, detail="Unable to render PDF preview.")
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=88)
-        return Response(
-            content=buf.getvalue(),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "private, max-age=3600"},
-        )
+        try:
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=88)
+            return Response(
+                content=buf.getvalue(),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+        finally:
+            try:
+                pil_img.close()
+            except Exception:
+                pass
 
     mime_map = {
         ".jpg": "image/jpeg",

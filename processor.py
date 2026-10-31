@@ -387,12 +387,20 @@ def _extract_ocr_detailed(
     width, height = pil_img.size
     ocr_target = pil_img
     longest = max(width, height)
+    is_resized = False
     if longest > MAX_OCR_IMAGE_DIMENSION:
         scale = MAX_OCR_IMAGE_DIMENSION / float(longest)
         new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
         ocr_target = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+        is_resized = True
 
     rgb_array = np.asarray(ocr_target, dtype=np.uint8)
+    if is_resized:
+        try:
+            ocr_target.close()
+        except Exception:
+            pass
+
     bgr_array = rgb_array[:, :, ::-1].copy()
 
     engine = ocr_engine or _get_ocr_engine()
@@ -1526,11 +1534,17 @@ def _save_document_thumbnail(pil_img: Image.Image, file_hash_id: str) -> str:
     """Save a compressed preview thumbnail of a verified (upright) document to `data/thumbnails/`."""
     _ensure_data_dirs()
     thumb = pil_img.copy()
-    thumb.thumbnail(THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
-    filename = f"thumb_{file_hash_id}.jpg"
-    dest_path = THUMBNAILS_DIR / filename
-    thumb.save(dest_path, format="JPEG", quality=82, optimize=True)
-    return f"data/thumbnails/{filename}"
+    try:
+        thumb.thumbnail(THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
+        filename = f"thumb_{file_hash_id}.jpg"
+        dest_path = THUMBNAILS_DIR / filename
+        thumb.save(dest_path, format="JPEG", quality=82, optimize=True)
+        return f"data/thumbnails/{filename}"
+    finally:
+        try:
+            thumb.close()
+        except Exception:
+            pass
 
 
 def _crop_and_save_face(
@@ -1557,12 +1571,17 @@ def _crop_and_save_face(
 
     padded_crop = rgb_array[y1:y2, x1:x2]
     pil_crop = Image.fromarray(padded_crop).convert("RGB")
-    pil_crop.thumbnail(FACE_THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
-
-    filename = f"face_{file_hash_id}.jpg"
-    dest_path = FACES_DIR / filename
-    pil_crop.save(dest_path, format="JPEG", quality=88, optimize=True)
-    return core_face, f"data/faces/{filename}"
+    try:
+        pil_crop.thumbnail(FACE_THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
+        filename = f"face_{file_hash_id}.jpg"
+        dest_path = FACES_DIR / filename
+        pil_crop.save(dest_path, format="JPEG", quality=88, optimize=True)
+        return core_face, f"data/faces/{filename}"
+    finally:
+        try:
+            pil_crop.close()
+        except Exception:
+            pass
 
 
 GALLERY_FACE_MIN_SCORE = 0.55

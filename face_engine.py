@@ -467,6 +467,7 @@ def agglomerative_cluster_cleanup(
     active_people.sort(key=lambda x: int(x.get("document_count") or 0), reverse=True)
 
     parent: Dict[int, int] = {int(p["id"]): int(p["id"]) for p in active_people}
+    rank: Dict[int, int] = {int(p["id"]): idx for idx, p in enumerate(active_people)}
 
     def _find(i: int) -> int:
         path = []
@@ -480,8 +481,11 @@ def agglomerative_cluster_cleanup(
     def _union(i: int, j: int) -> None:
         ri, rj = _find(i), _find(j)
         if ri != rj:
-            # Union to the node with higher document count
-            parent[rj] = ri
+            # Deterministically union into root with higher document count (lowest rank index)
+            if rank[ri] <= rank[rj]:
+                parent[rj] = ri
+            else:
+                parent[ri] = rj
 
     n = len(active_people)
     for i in range(n):
